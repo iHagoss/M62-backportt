@@ -1,0 +1,601 @@
+name: Build KernelSU for Beyond2LTE
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_variant:
+        description: 'KernelSU variant to build'
+        required: true
+        default: 'KernelSU-Next'
+        type: choice
+        options:
+          - 'KernelSU-Next'
+          - 'KernelSU'
+      kernelsu_tag:
+        description: 'KernelSU tag to build'
+        required: true
+        default: 'next'
+        type: string
+      susfs_repo:
+        description: 'SUSFS repository to use'
+        required: true
+        default: 'https://gitlab.com/simonpunk/susfs4ksu.git'
+        type: choice
+        options:
+          - 'https://gitlab.com/simonpunk/susfs4ksu.git'
+          - 'https://github.com/iHagoss/susfs4ksu.git'
+          - 'https://github.com/iHagoss/susfs4ksu-begonia.git'
+      device:
+        description: 'Device to build for'
+        required: true
+        default: 'beyond2lte'
+        type: choice
+        options:
+          - 'beyond2lte'
+          - 'beyond1lte'
+          - 'beyond0lte'
+          - 'beyondx'
+          - 'beyondxq'
+          - 'beyond0q'
+          - 'beyond1q'
+          - 'beyond2q'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GH_PUSH_TOKEN }}
+  ARCH: arm64
+  SUBARCH: arm64
+  DEVICE: ${{ inputs.device }}
+  # DEFCONFIG will be set dynamically in the "Find and prepare defconfig" step
+  KERNEL_NAME: ExtremeKRNL-Nexus-KernelSU
+  CLANG_VERSION: "18.0.0"
+  BUILD_USER: iHagoss
+  BUILD_HOST: github-actions
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GH_PUSH_TOKEN }}
+        fetch-depth: 0
+        submodules: recursive
+
+    - name: Setup build environment
+      run: |
+        echo "Updating apt and installing build dependencies..."
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          git \
+          wget \
+          curl \
+          zip \
+          unzip \
+          python3 \
+          python3-pip \
+          ccache \
+          clang \
+          lld \
+          llvm \
+          gcc-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabihf
+        echo "Build environment setup complete."
+
+    - name: Setup ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ env.DEVICE }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ env.DEVICE }}-
+      env:
+        CCACHE_DIR: ~/.ccache # Ensure ccache uses this path for the cache action
+
+    - name: Configure ccache
+      run: |
+        echo "Configuring ccache..."
+        ccache --set-config=max_size=2G
+        ccache --set-config=compression=true
+        ccache --zero-stats
+        ccache --show-config
+        echo "ccache configured."
+
+    - name: Setup toolchain symlinks
+      run: |
+        echo "Setting up toolchain symlinks..."
+        sudo mkdir -p /usr/local/bin
+        
+        # Create Android-specific symlinks for aarch64
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-android-gcc
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-g++ /usr/local/bin/aarch64-linux-android-g++
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-ar /usr/local/bin/aarch64-linux-android-ar
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-as /usr/local/bin/aarch64-linux-android-as
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-ld /usr/local/bin/aarch64-linux-android-ld
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-strip /usr/local/bin/aarch64-linux-android-strip
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-objcopy /usr/local/bin/aarch64-linux-android-objcopy
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-objdump /usr/local/bin/aarch64-linux-android-objdump
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-nm /usr/local/bin/aarch64-linux-android-nm
+        sudo ln -sf /usr/bin/aarch64-linux-gnu-ranlib /usr/local/bin/aarch64-linux-android-ranlib
+        
+        # Create Android-specific symlinks for arm
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-gcc /usr/local/bin/arm-linux-androideabi-gcc
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-g++ /usr/local/bin/arm-linux-androideabi-g++
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-ar /usr/local/bin/arm-linux-androideabi-ar
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-as /usr/local/bin/arm-linux-androideabi-as
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-ld /usr/local/bin/arm-linux-androideabi-ld
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-strip /usr/local/bin/arm-linux-androideabi-strip
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-objcopy /usr/local/bin/arm-linux-androideabi-objcopy
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-objdump /usr/local/bin/arm-linux-androideabi-objdump
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-nm /usr/local/bin/arm-linux-androideabi-nm
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-ranlib /usr/local/bin/arm-linux-androideabi-ranlib
+        
+        # Verify toolchain setup
+        echo "✅ Toolchain setup complete!"
+        echo "Clang version:"
+        clang --version
+        echo "GCC aarch64 version:"
+        aarch64-linux-android-gcc --version
+        echo "GCC arm version:"
+        arm-linux-androideabi-gcc --version
+
+    - name: Clone KernelSU
+      run: |
+        echo "Cloning KernelSU variant: ${{ inputs.kernelsu_variant }}"
+        echo "Using tag: ${{ inputs.kernelsu_tag }}"
+        
+        if [ "${{ inputs.kernelsu_variant }}" == "KernelSU-Next" ]; then
+          git clone --depth=1 --branch ${{ inputs.kernelsu_tag }} https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU || { echo "❌ Failed to clone KernelSU-Next!"; exit 1; }
+        else
+          git clone --depth=1 --branch ${{ inputs.kernelsu_tag }} https://github.com/tiann/KernelSU.git KernelSU || { echo "❌ Failed to clone KernelSU!"; exit 1; }
+        fi
+        
+        echo "KernelSU directory contents:"
+        ls -la KernelSU/
+        if [ -d "KernelSU/kernel" ]; then
+          echo "KernelSU/kernel directory contents:"
+          ls -la KernelSU/kernel/
+        fi
+
+    - name: Clone SUSFS
+      run: |
+        echo "Cloning SUSFS from: ${{ inputs.susfs_repo }}"
+        git clone --depth=1 ${{ inputs.susfs_repo }} susfs || { echo "❌ Failed to clone SUSFS!"; exit 1; }
+        
+        echo "SUSFS directory contents:"
+        ls -la susfs/
+        if [ -d "susfs/kernel_patches" ]; then
+          echo "SUSFS kernel_patches directory contents:"
+          ls -la susfs/kernel_patches/
+        fi
+
+    - name: Integrate KernelSU
+      run: |
+        echo "Integrating KernelSU..."
+        
+        if [ ! -d "KernelSU" ]; then
+          echo "❌ KernelSU directory not found!"
+          exit 1
+        fi
+        
+        KERNELSU_SOURCE_ROOT_IN_CLONE=""
+        if [ -d "KernelSU/kernel" ]; then
+          KERNELSU_SOURCE_ROOT_IN_CLONE="KernelSU/kernel"
+          echo "✅ Found KernelSU kernel directory: KernelSU/kernel"
+        elif [ -d "KernelSU/ksu" ]; then
+          KERNELSU_SOURCE_ROOT_IN_CLONE="KernelSU/ksu"
+          echo "✅ Found KernelSU ksu directory: KernelSU/ksu"
+        else
+          echo "❌ KernelSU kernel files not found in expected locations (KernelSU/kernel or KernelSU/ksu) inside KernelSU clone!"
+          echo "Listing contents of KernelSU directory:"
+          ls -R KernelSU || true
+          exit 1
+        fi
+
+        echo "Attempting to copy KernelSU files from '$KERNELSU_SOURCE_ROOT_IN_CLONE' to kernel source root (current directory)..."
+        cp -r "$KERNELSU_SOURCE_ROOT_IN_CLONE"/* ./ || { echo "❌ Failed to copy KernelSU files! This is critical."; exit 1; }
+        echo "Contents of kernel root after KernelSU copy (showing relevant files/dirs):"
+        ls -l ksu.c fs/ security/include/ include/linux/ || true # Check for key files copied
+        find . -maxdepth 3 -name "*ksu*" -o -name "setup.sh" -o -name "Kconfig" || true # More broad search
+        
+        # Check for setup.sh in the current directory (kernel root)
+        if [ -f "setup.sh" ]; then
+          echo "✅ Found KernelSU setup script (now in kernel root), running: bash ./setup.sh"
+          chmod +x ./setup.sh
+          # IMPORTANT: The KernelSU setup.sh often expects to be run FROM the kernel root
+          # and applies patches assuming relative paths. If it uses absolute paths, it will fail.
+          bash ./setup.sh || { echo "❌ KernelSU setup.sh failed during execution! This likely points to incorrect paths in the script itself."; exit 1; }
+        elif [ -f "$KERNELSU_SOURCE_ROOT_IN_CLONE/setup.sh" ]; then
+          echo "⚠️  KernelSU setup script not copied to kernel root, attempting to run from original cloned dir: $KERNELSU_SOURCE_ROOT_IN_CLONE/setup.sh"
+          echo "This might lead to pathing issues if setup.sh uses relative paths assuming kernel root."
+          chmod +x "$KERNELSU_SOURCE_ROOT_IN_CLONE/setup.sh"
+          bash "$KERNELSU_SOURCE_ROOT_IN_CLONE/setup.sh" || { echo "❌ KernelSU setup.sh failed from original path! This likely points to incorrect paths in the script itself."; exit 1; }
+        else
+          echo "⚠️  KernelSU setup script not found in expected locations after copy or in original dir. Proceeding without explicit setup.sh run for KernelSU. KernelSU might not be correctly integrated."
+        fi
+        
+        # Verify KernelSU integration files after patching attempts
+        echo "Verifying KernelSU integration after setup/copy:"
+        if [ -f "ksu.c" ] || [ -f "kernel/ksu.c" ]; then
+          echo "✅ KernelSU core files (ksu.c) found in kernel root."
+        else
+          echo "❌ KernelSU core files (ksu.c) NOT found in kernel root. Integration likely failed. This is a critical error."
+          exit 1 # Fail if ksu.c is not in the kernel root
+        fi
+        if grep -q "CONFIG_KSU" Kconfig 2>/dev/null; then
+            echo "✅ CONFIG_KSU entry found in Kconfig (post-integration check)."
+        else
+            echo "⚠️  CONFIG_KSU entry NOT found in Kconfig. This is unusual; KernelSU setup should add it. Build might fail."
+        fi
+        echo "Current directory contents around KernelSU problem areas:"
+        ls -l fs/ security/selinux/include/ include/linux/ || true
+
+    - name: Integrate SUSFS
+      run: |
+        echo "Integrating SUSFS..."
+        
+        if [ ! -d "susfs" ]; then
+          echo "❌ SUSFS directory not found!"
+          exit 1
+        fi
+        
+        SUSFS_SOURCE_ROOT_IN_CLONE=""
+        # Try different SUSFS integration methods by copying contents to kernel root
+        if [ -d "susfs/kernel_patches" ]; then
+          SUSFS_SOURCE_ROOT_IN_CLONE="susfs/kernel_patches"
+          echo "✅ Found SUSFS kernel_patches directory: $SUSFS_SOURCE_ROOT_IN_CLONE"
+        elif [ -d "susfs/kernel" ]; then
+          SUSFS_SOURCE_ROOT_IN_CLONE="susfs/kernel"
+          echo "✅ Found SUSFS kernel directory: $SUSFS_SOURCE_ROOT_IN_CLONE"
+        else
+          echo "⚠️  No obvious SUSFS kernel content directory found inside susfs clone (expected susfs/kernel_patches or susfs/kernel)."
+          echo "Listing contents of susfs directory:"
+          ls -R susfs || true
+        fi
+
+        if [ -n "$SUSFS_SOURCE_ROOT_IN_CLONE" ]; then
+            echo "Attempting to copy SUSFS files from '$SUSFS_SOURCE_ROOT_IN_CLONE' to kernel source root (current directory)..."
+            cp -r "$SUSFS_SOURCE_ROOT_IN_CLONE"/* ./ || { echo "❌ Failed to copy SUSFS files!"; }
+            echo "Contents of kernel root after SUSFS copy (showing relevant files/dirs):"
+            ls -l susfs.c || true # Check for key files copied
+            find . -maxdepth 3 -name "*susfs*" -o -name "setup.sh" -o -name "Kconfig" || true # More broad search
+        fi
+        
+        # Run SUSFS setup script if it exists
+        if [ -f "setup.sh" ]; then # Check for setup.sh if it was copied directly to kernel root
+            echo "✅ Found SUSFS setup script (now in kernel root), running: bash ./setup.sh"
+            chmod +x ./setup.sh
+            bash ./setup.sh || { echo "❌ SUSFS setup.sh failed during execution!"; exit 1; }
+        elif [ -f "$SUSFS_SOURCE_ROOT_IN_CLONE/setup.sh" ]; then # Check original cloned path
+          echo "⚠️  SUSFS setup script not copied to kernel root, attempting to run from original cloned dir: $SUSFS_SOURCE_ROOT_IN_CLONE/setup.sh"
+          echo "This might lead to pathing issues if setup.sh expects to be in kernel root."
+          chmod +x "$SUSFS_SOURCE_ROOT_IN_CLONE/setup.sh"
+          bash "$SUSFS_SOURCE_ROOT_IN_CLONE/setup.sh" || { echo "❌ SUSFS setup.sh failed from original path!"; exit 1; }
+        elif [ -f "susfs/setup.sh" ]; then # Check the root of the cloned susfs repo
+          echo "⚠️  SUSFS setup script found in susfs/setup.sh, running it from there. This might lead to pathing issues."
+          chmod +x "susfs/setup.sh"
+          bash "susfs/setup.sh" || { echo "❌ SUSFS setup.sh failed from susfs/setup.sh!"; exit 1; }
+        else
+          echo "⚠️  SUSFS setup script not found in expected locations. Proceeding without explicit setup.sh run for SUSFS. SUSFS might not be correctly integrated."
+        fi
+        
+        # Verify SUSFS integration after patching attempts
+        echo "Verifying SUSFS integration after setup/copy:"
+        if [ -f "susfs.c" ] || grep -q "CONFIG_KSU_SUSFS" Kconfig 2>/dev/null || grep -q "CONFIG_KSU_SUSFS" .config 2>/dev/null; then
+            echo "✅ SUSFS files/configs appear integrated (susfs.c or CONFIG_KSU_SUSFS found)."
+        else
+            echo "⚠️  SUSFS integration verification failed (no common SUSFS file/config found). Continuing anyway."
+        fi
+        echo "Current directory contents around SUSFS problem areas:"
+        ls -l fs/ security/selinux/include/ include/linux/ || true
+
+
+    - name: Find and prepare defconfig
+      run: |
+        echo "Searching for defconfig files..."
+        
+        echo "Available defconfig files:"
+        find arch/arm64/configs -name "*${{ inputs.device }}*" -o -name "*beyond*" -o -name "*exynos9820*" | head -10
+        
+        DEFCONFIG_FOUND=false
+        SELECTED_DEFCONFIG=""
+        for config in ${{ inputs.device }}_defconfig ${DEVICE}_defconfig beyond2lte_defconfig beyond_defconfig exynos9820-beyond2lte_defconfig exynos9820_defconfig; do
+          if [ -f "arch/arm64/configs/$config" ]; then
+            echo "✅ Found defconfig: $config"
+            SELECTED_DEFCONFIG="$config"
+            DEFCONFIG_FOUND=true
+            break
+          fi
+        done
+        
+        if [ "$DEFCONFIG_FOUND" = false ]; then
+          FOUND_CONFIG=$(find arch/arm64/configs -name "*${{ inputs.device }}*" | head -1)
+          if [ -n "$FOUND_CONFIG" ]; then
+            SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
+            echo "✅ Using fallback defconfig: $SELECTED_DEFCONFIG"
+            DEFCONFIG_FOUND=true
+          else
+            FOUND_CONFIG=$(find arch/arm64/configs -name "*beyond*" | head -1)
+            if [ -n "$FOUND_CONFIG" ]; then
+              SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
+              echo "✅ Using beyond fallback defconfig: $SELECTED_DEFCONFIG"
+              DEFCONFIG_FOUND=true
+            fi
+          fi
+        fi
+        
+        if [ "$DEFCONFIG_FOUND" = false ]; then
+          echo "❌ No suitable defconfig found!"
+          echo "Available defconfigs in arch/arm64/configs:"
+          ls -la arch/arm64/configs/ | grep -E "(beyond|exynos|${{ inputs.device }})" || true
+          exit 1
+        else
+          echo "DEFCONFIG=$SELECTED_DEFCONFIG" >> $GITHUB_ENV # Set environment variable for subsequent steps
+        fi
+        echo "Selected DEFCONFIG: ${{ env.DEFCONFIG }}"
+
+    - name: Configure kernel
+      run: |
+        echo "Configuring kernel with defconfig: ${{ env.DEFCONFIG }}"
+        
+        if [ ! -f Makefile ]; then
+          echo "❌ No Makefile found in current directory! This indicates a critical problem with kernel source checkout or prior integration steps."
+          ls -la
+          exit 1
+        fi
+        
+        echo "Cleaning previous builds (if any)..."
+        # Use || true to prevent job failure if clean/mrproper targets are not yet available or fail
+        make clean CC=clang ARCH=$ARCH SUBARCH=$SUBARCH CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- || true
+        make mrproper CC=clang ARCH=$ARCH SUBARCH=$SUBARCH CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- || true
+        echo "Previous builds cleaned."
+        
+        echo "Running defconfig target to generate .config file..."
+        make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- ${{ env.DEFCONFIG }} || { echo "❌ Failed to apply defconfig!"; exit 1; }
+        
+        if [ ! -f .config ]; then
+            echo "❌ .config file was not created after running defconfig. Kernel configuration failed. This is critical."
+            exit 1
+        fi
+
+        echo "Current .config content before KSU/SUSFS additions (grep for relevant configs):"
+        grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" .config || true # Show existing KSU/SUSFS lines
+
+        echo "Appending KernelSU config to .config..."
+        echo "CONFIG_KSU=y" >> .config
+        echo "CONFIG_KSU_DEBUG=n" >> .config
+        
+        echo "Checking for SUSFS support and appending to .config if needed..."
+        # Checking Kconfig is more reliable for whether the option exists at all.
+        # If the Kconfig for SUSFS is present, we enable it.
+        if grep -q "CONFIG_KSU_SUSFS" Kconfig 2>/dev/null; then
+          echo "✅ Enabling SUSFS support in .config based on Kconfig presence."
+          echo "CONFIG_KSU_SUSFS=y" >> .config
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> .config
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> .config
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> .config
+        else
+          echo "⚠️  CONFIG_KSU_SUSFS not found in Kconfig. Skipping SUSFS config injection. Ensure SUSFS Kconfig patches are applied."
+          # Remove any potential stale SUSFS configs to prevent build issues
+          sed -i '/CONFIG_KSU_SUSFS/d' .config
+          sed -i '/CONFIG_KSU_SUSFS_SUS_MOUNT/d' .config
+          sed -i '/CONFIG_KSU_SUSFS_SUS_KSTAT/d' .config
+          sed -i '/CONFIG_KSU_SUSFS_SUS_OVERLAYFS/d' .config
+        fi
+        
+        echo "Running olddefconfig to reconcile .config and resolve dependencies after manual changes..."
+        make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- CLANG_TRIPLE=aarch64-linux-gnu- olddefconfig || { echo "❌ olddefconfig failed!"; exit 1; }
+        
+        echo "Final .config content (grep for relevant configs):"
+        grep -E "CONFIG_KSU|CONFIG_KSU_SUSFS" .config || true
+        
+        if grep -q "CONFIG_KSU=y" .config; then
+          echo "✅ KernelSU enabled in final .config."
+        else
+          echo "❌ KernelSU not found enabled in final .config. Build might fail without root functionality."
+          exit 1 # Fail if KSU is not enabled after configuration
+        fi
+        if grep -q "CONFIG_KSU_SUSFS=y" .config; then
+            echo "✅ SUSFS enabled in final .config."
+        else
+            echo "⚠️  SUSFS not found enabled in final .config. It might not be integrated correctly."
+        fi
+        echo "Kernel configuration complete."
+
+    - name: Build kernel
+      run: |
+        echo "Starting kernel build with $(nproc) parallel jobs..."
+        
+        make -j$(nproc) \
+          CC=clang \
+          ARCH=$ARCH \
+          SUBARCH=$SUBARCH \
+          CROSS_COMPILE=aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CONFIG_NO_ERROR_ON_MISMATCH=y \
+          V=1 \
+          2>&1 | tee build.log || { echo "❌ Kernel build failed! Check build.log for errors."; exit 1; }
+        
+        echo "Kernel build command finished."
+
+    - name: Check build result
+      run: |
+        echo "Checking build result..."
+        if [ -f arch/arm64/boot/Image ]; then
+          echo "✅ Kernel built successfully! Image found at arch/arm64/boot/Image"
+          echo "Kernel image details:"
+          ls -la arch/arm64/boot/
+          file arch/arm64/boot/Image
+        else
+          echo "❌ Kernel build failed! Image not found at arch/arm64/boot/Image"
+          echo "Build directory contents:"
+          ls -la arch/arm64/boot/ || echo "Boot directory not found"
+          echo ""
+          echo "Last 100 lines of build log:"
+          tail -100 build.log || true
+          echo ""
+          echo "Error summary (last 20 lines with 'error' keyword):"
+          grep -i error build.log | tail -20 || true
+          echo ""
+          echo "Warning summary (last 20 lines with 'warning' keyword):"
+          grep -i warning build.log | tail -20 || true
+          exit 1
+        fi
+
+    - name: Prepare kernel image
+      run: |
+        echo "Preparing kernel image for packaging..."
+        mkdir -p output
+        
+        cp arch/arm64/boot/Image output/ || { echo "❌ Failed to copy Image!"; exit 1; }
+        
+        TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+        KERNEL_ZIP="$KERNEL_NAME-$DEVICE-${{ inputs.kernelsu_variant }}-$TIMESTAMP.zip"
+        echo "KERNEL_ZIP=$KERNEL_ZIP" >> $GITHUB_ENV
+        
+        KERNEL_VERSION=$(cat include/config/kernel.release 2>/dev/null || echo "unknown")
+        echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+        
+        cat > output/build_info.txt << EOF
+        Kernel: $KERNEL_NAME
+        Device: $DEVICE
+        Version: $KERNEL_VERSION
+        KernelSU: ${{ inputs.kernelsu_variant }} (${{ inputs.kernelsu_tag }})
+        SUSFS: ${{ inputs.susfs_repo }}
+        Built: $(date)
+        Builder: $BUILD_USER
+        Commit: $GITHUB_SHA
+        EOF
+        
+        echo "✅ Kernel preparation completed."
+
+    - name: Create flashable zip
+      run: |
+        echo "Creating flashable zip..."
+        mkdir -p output/anykernel3_temp # Create a temporary directory for AnyKernel3 operations
+        cd output/anykernel3_temp
+        
+        echo "Downloading AnyKernel3..."
+        wget -q https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip || { echo "❌ Failed to download AnyKernel3!"; exit 1; }
+        unzip -q master.zip || { echo "❌ Failed to unzip AnyKernel3!"; exit 1; }
+        cp -r AnyKernel3-master/* . || { echo "❌ Failed to copy AnyKernel3 contents!"; exit 1; }
+        rm -rf AnyKernel3-master master.zip
+        
+        # Configure AnyKernel3 for selected device
+        # Use single quotes for the EOF block to prevent shell variable expansion prematurely
+        cat > anykernel.sh << 'EOF'
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+        
+        ## AnyKernel setup
+        # begin properties
+        properties() { '
+        kernel.string=ExtremeKRNL-Nexus-KernelSU
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=${{ env.DEVICE }} # Use env.DEVICE here for consistency
+        device.name2=beyond2lte
+        device.name3=SM-G975F
+        device.name4=beyond1lte
+        device.name5=SM-G973F
+        supported.versions=9-14
+        supported.patchlevels=
+        '; } # end properties
+        
+        # shell variables
+        block=/dev/block/platform/13d60000.ufs/by-name/boot;
+        is_slot_device=0;
+        ramdisk_compression=auto;
+        
+        ## AnyKernel methods (DO NOT CHANGE)
+        # import patching functions/variables - see for reference
+        . tools/ak3-core.sh;
+        
+        ## AnyKernel file attributes
+        # set permissions/ownership for included ramdisk files
+        set_perm_recursive 0 0 755 644 $ramdisk/*;
+        set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+        
+        ## AnyKernel boot install
+        dump_boot;
+        write_boot;
+        EOF
+        
+        cp ../Image . || { echo "❌ Failed to copy kernel Image to AnyKernel3 dir!"; exit 1; }
+        
+        echo "Creating flashable zip: ../${{ env.KERNEL_ZIP }}"
+        zip -r ../${{ env.KERNEL_ZIP }} ./* -x "*.git*" "*.md" "*.txt" || { echo "❌ Failed to create flashable zip!"; exit 1; }
+        
+        cd ../.. # Go back to the root of the repo
+        rm -rf output/anykernel3_temp # Clean up temporary AnyKernel3 directory
+        echo "✅ Flashable zip created: output/${{ env.KERNEL_ZIP }}"
+        ls -la output/${{ env.KERNEL_ZIP }} || true
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.KERNEL_ZIP }}
+        path: |
+          output/${{ env.KERNEL_ZIP }}
+          output/build_info.txt
+          build.log
+
+    - name: Create release
+      uses: softprops/action-gh-release@v1
+      if: github.ref == 'refs/heads/main'
+      with:
+        tag_name: ${{ env.KERNEL_VERSION }}-${{ github.run_number }}
+        name: ${{ env.KERNEL_NAME }} - ${{ env.KERNEL_VERSION }}
+        body: |
+          ## KernelSU Build for ${{ inputs.device }}
+          
+          **Device:** ${{ env.DEVICE }}
+          **Kernel Version:** ${{ env.KERNEL_VERSION }}
+          **KernelSU:** ${{ inputs.kernelsu_variant }} (${{ inputs.kernelsu_tag }})
+          **SUSFS:** ${{ inputs.susfs_repo }}
+          **Built:** $(date)
+          
+          ### Installation
+          1. Boot into custom TWRP (Extreme's version)
+          2. Flash the kernel zip
+          3. Reboot
+          4. Install KernelSU manager app
+          
+          ### Features
+          - KernelSU integrated
+          - SUSFS support
+          - Optimized for Extreme ROM NEXUS
+          - Self-healing build system
+          
+        files: |
+          output/${{ env.KERNEL_ZIP }}
+          output/build_info.txt
+        token: ${{ secrets.GH_PUSH_TOKEN }}
+
+    - name: Build summary
+      run: |
+        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "- **Kernel:** $KERNEL_NAME" >> $GITHUB_STEP_SUMMARY
+        echo "- **Device:** $DEVICE" >> $GITHUB_STEP_SUMMARY
+        echo "- **Version:** $KERNEL_VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "- **KernelSU:** ${{ inputs.kernelsu_variant }} (${{ inputs.kernelsu_tag }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **SUSFS:** ${{ inputs.susfs_repo }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Output:** $KERNEL_ZIP" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ccache stats" >> $GITHUB_STEP_SUMMARY
+        ccache --show-stats >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ccache stats (repeated for visibility)" >> $GITHUB_STEP_SUMMARY
+        ccache --show-stats >> $GITHUB_STEP_SUMMARY
