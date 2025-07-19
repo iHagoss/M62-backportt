@@ -151,8 +151,10 @@ jobs:
         echo "Cloning KernelSU variant: ${{ inputs.kernelsu_variant }}"
         echo "Using tag: ${{ inputs.kernelsu_tag }}"
         
+        # *** IMPORTANT CHANGE HERE ***
+        # Use your forked KernelSU-Next repository to ensure your Makefile changes are pulled.
         if [ "${{ inputs.kernelsu_variant }}" == "KernelSU-Next" ]; then
-          git clone --depth=1 --branch ${{ inputs.kernelsu_tag }} https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU || { echo "❌ Failed to clone KernelSU-Next!"; exit 1; }
+          git clone --depth=1 --branch ${{ inputs.kernelsu_tag }} https://github.com/iHagoss/KernelSU-Next.git KernelSU || { echo "❌ Failed to clone KernelSU-Next!"; exit 1; }
         else
           git clone --depth=1 --branch ${{ inputs.kernelsu_tag }} https://github.com/tiann/KernelSU.git KernelSU || { echo "❌ Failed to clone KernelSU!"; exit 1; }
         fi
@@ -235,7 +237,7 @@ jobs:
             echo "⚠️  CONFIG_KSU entry NOT found in Kconfig. This is unusual; KernelSU setup should add it. Build might fail."
         fi
         echo "Current directory contents around KernelSU problem areas:"
-        ls -l fs/ security/selinux/include/ include/linux/ || true
+        ls -l ksu.c fs/ security/selinux/include/ include/linux/ || true
 
     - name: Integrate SUSFS
       run: |
@@ -262,13 +264,34 @@ jobs:
 
         if [ -n "$SUSFS_SOURCE_ROOT_IN_CLONE" ]; then
             echo "Attempting to copy SUSFS files from '$SUSFS_SOURCE_ROOT_IN_CLONE' to kernel source root (current directory)..."
-            cp -r "$SUSFS_SOURCE_ROOT_IN_CLONE"/* ./ || { echo "❌ Failed to copy SUSFS files!"; }
+            # Explicitly create target directories if they don't exist before copying specific files
+            mkdir -p fs include/linux
+            cp -r "$SUSFS_SOURCE_ROOT_IN_CLONE"/fs/* fs/ || { echo "❌ Failed to copy SUSFS fs files!"; }
+            cp -r "$SUSFS_SOURCE_ROOT_IN_CLONE"/include/linux/* include/linux/ || { echo "❌ Failed to copy SUSFS include files!"; }
+            # Only copy other potential files if they exist at the top level of kernel_patches
+            if [ -f "$SUSFS_SOURCE_ROOT_IN_CLONE"/Kconfig ]; then
+                cp "$SUSFS_SOURCE_ROOT_IN_CLONE"/Kconfig . || { echo "❌ Failed to copy SUSFS Kconfig!"; }
+            fi
+            if [ -f "$SUSFS_SOURCE_ROOT_IN_CLONE"/Makefile ]; then
+                cp "$SUSFS_SOURCE_ROOT_IN_CLONE"/Makefile . || { echo "❌ Failed to copy SUSFS Makefile!"; }
+            fi
+            if [ -f "$SUSFS_SOURCE_ROOT_IN_CLONE"/50_add_susfs_in_kernel.patch ]; then
+                cp "$SUSFS_SOURCE_ROOT_IN_CLONE"/50_add_susfs_in_kernel.patch . || { echo "❌ Failed to copy SUSFS patch file!"; }
+            fi
+
             echo "Contents of kernel root after SUSFS copy (showing relevant files/dirs):"
-            ls -l susfs.c || true # Check for key files copied
-            find . -maxdepth 3 -name "*susfs*" -o -name "setup.sh" -o -name "Kconfig" || true # More broad search
+            ls -l fs/susfs.c include/linux/susfs.h || true # Check for key files copied
         fi
         
-        # Run SUSFS setup script if it exists
+        # Now apply the SUSFS patch if it's there
+        if [ -f "50_add_susfs_in_kernel.patch" ]; then
+            echo "✅ Found SUSFS patch (50_add_susfs_in_kernel.patch), applying..."
+            patch -p1 < 50_add_susfs_in_kernel.patch || { echo "❌ Failed to apply 50_add_susfs_in_kernel.patch! Manual intervention may be needed."; exit 1; }
+        else
+            echo "⚠️  SUSFS patch (50_add_susfs_in_kernel.patch) not found. SUSFS might not be fully integrated."
+        fi
+
+        # Run SUSFS setup script if it exists (less common for SUSFS itself, but checking)
         if [ -f "setup.sh" ]; then # Check for setup.sh if it was copied directly to kernel root
             echo "✅ Found SUSFS setup script (now in kernel root), running: bash ./setup.sh"
             chmod +x ./setup.sh
@@ -288,14 +311,19 @@ jobs:
         
         # Verify SUSFS integration after patching attempts
         echo "Verifying SUSFS integration after setup/copy:"
-        if [ -f "susfs.c" ] || grep -q "CONFIG_KSU_SUSFS" Kconfig 2>/dev/null || grep -q "CONFIG_KSU_SUSFS" .config 2>/dev/null; then
-            echo "✅ SUSFS files/configs appear integrated (susfs.c or CONFIG_KSU_SUSFS found)."
+        if [ -f "fs/susfs.c" ] && [ -f "include/linux/susfs.h" ]; then
+            echo "✅ SUSFS core files (fs/susfs.c and include/linux/susfs.h) found."
         else
-            echo "⚠️  SUSFS integration verification failed (no common SUSFS file/config found). Continuing anyway."
+            echo "❌ SUSFS core files (fs/susfs.c or include/linux/susfs.h) NOT found. SUSFS integration verification failed. This is critical for SUSFS."
+            exit 1 # Fail if SUSFS core files are not in expected location
+        fi
+        if grep -q "CONFIG_KSU_SUSFS" Kconfig 2>/dev/null; then
+            echo "✅ CONFIG_KSU_SUSFS entry found in Kconfig (post-integration check)."
+        else
+            echo "⚠️  CONFIG_KSU_SUSFS entry NOT found in Kconfig. This is unusual; SUSFS setup should add it. Build might fail."
         fi
         echo "Current directory contents around SUSFS problem areas:"
         ls -l fs/ security/selinux/include/ include/linux/ || true
-
 
     - name: Find and prepare defconfig
       run: |
