@@ -1,5 +1,7 @@
-    - name: Integrate KernelSU
-      run: |
+- name: Integrate KernelSU
+  run: |.
+
+
         echo "Integrating KernelSU..."
         
         if [ ! -d "KernelSU" ]; then
