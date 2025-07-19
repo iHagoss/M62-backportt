@@ -176,6 +176,7 @@ jobs:
         
         # If still not found, try pattern matching
         if [ "$DEFCONFIG_FOUND" = false ]; then
+          echo "No exact match found. Searching with patterns..."
           FOUND_CONFIG=$(find arch/arm64/configs -name "*${{ inputs.device }}*" | head -1)
           if [ -n "$FOUND_CONFIG" ]; then
             SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
@@ -193,19 +194,50 @@ jobs:
                 SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
                 echo "✅ Using exynos pattern defconfig: $SELECTED_DEFCONFIG"
                 DEFCONFIG_FOUND=true
+              else
+                FOUND_CONFIG=$(find arch/arm64/configs -name "*universal*" | head -1)
+                if [ -n "$FOUND_CONFIG" ]; then
+                  SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
+                  echo "✅ Using universal pattern defconfig: $SELECTED_DEFCONFIG"
+                  DEFCONFIG_FOUND=true
+                else
+                  FOUND_CONFIG=$(find arch/arm64/configs -name "*samsung*" | head -1)
+                  if [ -n "$FOUND_CONFIG" ]; then
+                    SELECTED_DEFCONFIG=$(basename "$FOUND_CONFIG")
+                    echo "✅ Using samsung pattern defconfig: $SELECTED_DEFCONFIG"
+                    DEFCONFIG_FOUND=true
+                  fi
+                fi
               fi
             fi
           fi
         fi
         
+        # Last resort: use the first available defconfig
         if [ "$DEFCONFIG_FOUND" = false ]; then
-          echo "❌ No suitable defconfig found!"
+          echo "⚠️ No suitable defconfig found with patterns. Using first available defconfig..."
+          FIRST_CONFIG=$(ls arch/arm64/configs/ | head -1)
+          if [ -n "$FIRST_CONFIG" ]; then
+            SELECTED_DEFCONFIG="$FIRST_CONFIG"
+            echo "✅ Using first available defconfig: $SELECTED_DEFCONFIG"
+            DEFCONFIG_FOUND=true
+          fi
+        fi
+        
+        if [ "$DEFCONFIG_FOUND" = false ]; then
+          echo "❌ No defconfig found at all!"
           echo "All available defconfigs:"
           ls -la arch/arm64/configs/
           exit 1
         else
           echo "DEFCONFIG=$SELECTED_DEFCONFIG" >> $GITHUB_ENV
           echo "Final selected DEFCONFIG: $SELECTED_DEFCONFIG"
+          
+          # Verify the defconfig file actually exists
+          if [ ! -f "arch/arm64/configs/$SELECTED_DEFCONFIG" ]; then
+            echo "❌ Selected defconfig file does not exist: arch/arm64/configs/$SELECTED_DEFCONFIG"
+            exit 1
+          fi
         fi
 
     - name: Clone KernelSU as submodule
@@ -226,6 +258,14 @@ jobs:
         fi
         
         git submodule update --init --recursive
+        
+        # Set KSU_GIT_VERSION before building
+        cd KernelSU
+        KSU_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "unknown")
+        cd ..
+        export KSU_GIT_VERSION="$KSU_VERSION"
+        echo "KSU_GIT_VERSION=$KSU_VERSION" >> $GITHUB_ENV
+        echo "KernelSU version: $KSU_VERSION"
         
         echo "KernelSU submodule added successfully"
         echo "KernelSU directory contents:"
@@ -248,12 +288,8 @@ jobs:
           exit 1
         fi
         
-        # Set KSU_GIT_VERSION to avoid Makefile warnings
-        cd KernelSU
-        KSU_VERSION=$(git describe --tags --always --dirty)
-        cd ..
-        export KSU_GIT_VERSION="$KSU_VERSION"
-        echo "KSU_GIT_VERSION=$KSU_VERSION" >> $GITHUB_ENV
+        # Set KSU_GIT_VERSION environment variable
+        export KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}"
         
         # Find KernelSU kernel source directory
         KERNELSU_SOURCE_ROOT=""
@@ -277,6 +313,7 @@ jobs:
         if [ -f "setup.sh" ]; then
           echo "Running KernelSU setup script..."
           chmod +x ./setup.sh
+          export KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}"
           bash ./setup.sh || { echo "❌ KernelSU setup failed!"; exit 1; }
         fi
         
@@ -330,20 +367,31 @@ jobs:
       run: |
         echo "Configuring kernel with defconfig: ${{ env.DEFCONFIG }}"
         
+        # Set KSU environment variable
+        export KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}"
+        
+        # Verify defconfig exists
+        if [ ! -f "arch/arm64/configs/${{ env.DEFCONFIG }}" ]; then
+          echo "❌ Defconfig file not found: arch/arm64/configs/${{ env.DEFCONFIG }}"
+          echo "Available defconfigs:"
+          ls -la arch/arm64/configs/
+          exit 1
+        fi
+        
         # Clean any previous build artifacts (ignore errors)
         make clean ARCH=$ARCH 2>/dev/null || true
         make mrproper ARCH=$ARCH 2>/dev/null || true
         
         # Apply defconfig
         echo "Running defconfig..."
-        make ARCH=$ARCH SUBARCH=$SUBARCH ${{ env.DEFCONFIG }} || { 
-          echo "❌ Failed to apply defconfig!"; 
+        if ! make ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" ${{ env.DEFCONFIG }}; then
+          echo "❌ Failed to apply defconfig with KSU_GIT_VERSION!"
           echo "Trying with CC=clang..."
-          make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH ${{ env.DEFCONFIG }} || {
-            echo "❌ Defconfig failed with both attempts!"; 
-            exit 1; 
-          }
-        }
+          if ! make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" ${{ env.DEFCONFIG }}; then
+            echo "❌ Defconfig failed with both attempts!"
+            exit 1
+          fi
+        fi
         
         if [ ! -f .config ]; then
           echo "❌ .config file was not created!"
@@ -367,12 +415,12 @@ jobs:
         
         # Resolve configuration dependencies
         echo "Resolving configuration dependencies..."
-        make ARCH=$ARCH SUBARCH=$SUBARCH olddefconfig || {
-          make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH olddefconfig || {
+        if ! make ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" olddefconfig; then
+          if ! make CC=clang ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" olddefconfig; then
             echo "❌ olddefconfig failed!"; 
-            exit 1; 
-          }
-        }
+            exit 1
+          fi
+        fi
         
         # Verify KernelSU is enabled
         if grep -q "CONFIG_KSU=y" .config; then
@@ -403,6 +451,7 @@ jobs:
           CROSS_COMPILE=aarch64-linux-android- \
           CROSS_COMPILE_ARM32=arm-linux-androideabi- \
           CLANG_TRIPLE=aarch64-linux-gnu- \
+          KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" \
           CONFIG_NO_ERROR_ON_MISMATCH=y \
           2>&1 | tee build.log; then
           build_success=true
@@ -413,14 +462,15 @@ jobs:
         if [ "$build_success" = false ]; then
           echo "Clang build failed, trying with GCC..."
           make clean ARCH=$ARCH 2>/dev/null || true
-          make ARCH=$ARCH SUBARCH=$SUBARCH ${{ env.DEFCONFIG }} || exit 1
+          make ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" ${{ env.DEFCONFIG }} || exit 1
           echo "CONFIG_KSU=y" >> .config
-          make ARCH=$ARCH SUBARCH=$SUBARCH olddefconfig || exit 1
+          make ARCH=$ARCH SUBARCH=$SUBARCH KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" olddefconfig || exit 1
           
           if make -j$(nproc) \
             ARCH=$ARCH \
             SUBARCH=$SUBARCH \
             CROSS_COMPILE=aarch64-linux-gnu- \
+            KSU_GIT_VERSION="${{ env.KSU_GIT_VERSION }}" \
             CONFIG_NO_ERROR_ON_MISMATCH=y \
             2>&1 | tee -a build.log; then
             build_success=true
